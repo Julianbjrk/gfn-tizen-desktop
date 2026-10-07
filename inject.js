@@ -1,9 +1,13 @@
 /*
- * gfn-tizen-desktop v0.1.0 — TizenBrew mods-modul (MIT)
+ * gfn-tizen-desktop v0.1.1 — TizenBrew mods-modul (MIT)
  *
- * TizenBrew kör den här filen vid "document start" i varje dokument som modulen
- * öppnar (CDP Page.addScriptToEvaluateOnNewDocument), alltså innan
- * play.geforcenow.com hinner läsa av webbläsaren.
+ * TizenBrew kör den här filen med CDP Runtime.evaluate så fort varje nytt
+ * dokument skapar sin JS-kontext. Det sker asynkront, så sidans tidigaste skript
+ * kan hinna före. Diagnostikrutan visar hur tidigt injektionen kom, och vid en
+ * sen injektion laddas sidan om en gång (då ligger modulen i TizenBrews cache
+ * och hinner oftast före sidans skript).
+ * (evaluateScriptOnDocumentStart används inte: i TizenBrew 2.0.5 öppnas sidan
+ * aldrig när man klickar på en sådan modul.)
  *
  * Vad den gör:
  *   1. Får GFN:s webbklient att se Chrome på Windows i stället för en Tizen-TV
@@ -19,7 +23,15 @@
 
   if (window.__gfnTizenDesktop) { return; }
 
-  var VERSION = '0.1.0';
+  // Hur långt sidan hunnit när TizenBrew injicerade oss (läses först av allt).
+  var injectedAt = {
+    ms: (window.performance && performance.now) ? Math.round(performance.now()) : -1,
+    readyState: document.readyState,
+    scripts: document.scripts ? document.scripts.length : 0
+  };
+  var lateInjection = injectedAt.readyState !== 'loading';
+
+  var VERSION = '0.1.1';
 
   var CONFIG = {
     spoof: true,                    // utge sig för att vara Chrome på Windows
@@ -27,6 +39,7 @@
     trySetHttpUserAgent: false,     // experiment E4: byt även HTTP-headerns UA via tizen.websetting (laddar om en gång)
     windowsPlatformVersion: '15.0.0', // motsvarar Windows 11 i client hints
     keepScreenOn: true,             // försök stänga av TV:ns skärmsläckare
+    reloadOnceIfLate: true,         // ladda om sidan en gång om injektionen kom efter att sidan tolkats
     overlay: {
       autoShowMs: 20000,            // visa rutan automatiskt så länge efter sidladdning (0 = av)
       toggleKeyCode: 406,           // blå knapp (ColorF3Blue)
@@ -263,6 +276,9 @@
       'Sida:           ' + location.host + trunc(location.pathname, 60),
       'Chromium:       ' + major + ' (' + fullVersion + ')',
       'Riktig UA:      ' + trunc(realUA, 120),
+      'Injektion:      ' + injectedAt.ms + ' ms efter sidstart, ' + injectedAt.readyState + ', ' +
+        injectedAt.scripts + ' skript före' + (lateInjection ? ' – SEN' : ' – tidig') +
+        (reloadedForLateness() ? ' (efter 1 omladdning)' : ''),
       'Spoof:          ' + (nav.userAgent === spoofUA ? 'aktiv – Windows/Chrome ' + major : 'INTE aktiv'),
       'UA-data:        ' + uaDataText(),
       'WebRTC:         ' + (window.RTCPeerConnection ? 'finns' : 'SAKNAS'),
@@ -372,12 +388,28 @@
   function onReady() {
     if (!isTop) { return; }
     log('sida laddad: ' + location.host + location.pathname);
+    log('injicerad efter ' + injectedAt.ms + ' ms (' + injectedAt.readyState + ', ' + injectedAt.scripts + ' skript)');
     if (CONFIG.keepScreenOn) { keepScreenOn(); }
     if (CONFIG.overlay.autoShowMs) { showOverlay(CONFIG.overlay.autoShowMs); }
     watchForUnsupportedText();
   }
 
   /* ------------------------------------------------------------ start */
+
+  function reloadedForLateness() {
+    try { return sessionStorage.getItem('gfnTizenLateReload') === '1'; } catch (e) { return false; }
+  }
+
+  // Sen injektion: sidans skript kan redan ha läst av webbläsaren. Ladda om en
+  // gång per flik och origin; nästa gång ligger modulen i TizenBrews cache.
+  if (CONFIG.reloadOnceIfLate && isTop && lateInjection && !reloadedForLateness()) {
+    try {
+      sessionStorage.setItem('gfnTizenLateReload', '1');
+      try { console.log('[gfn-tizen] sen injektion (' + injectedAt.readyState + '), laddar om en gång'); } catch (e) { /* ignorera */ }
+      location.reload();
+      return;
+    } catch (e) { /* sessionStorage saknas: fortsätt utan omladdning */ }
+  }
 
   if (CONFIG.hideTizenGlobals) { hideGlobals(); }
   if (CONFIG.spoof) { applySpoof(); }

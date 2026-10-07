@@ -6,7 +6,8 @@ Unofficial and for personal use. Not affiliated with NVIDIA or Samsung. Changing
 
 ## What it does
 
-- Overrides `navigator.userAgent`, `navigator.userAgentData` (including `getHighEntropyValues`), `platform` and `vendor` at document start. The real Chromium major version is kept.
+- Overrides `navigator.userAgent`, `navigator.userAgentData` (including `getHighEntropyValues`), `platform` and `vendor` as soon as TizenBrew injects the script into a new page. The real Chromium major version is kept.
+- If the injection arrives after the page has been parsed, reloads the page once (per tab and origin) so the cached script can run before the page's own scripts.
 - Shows a diagnostics panel on the TV (**blue** remote button). The panel lists the spoof status, WebRTC availability, video codecs, connected gamepads and recent errors.
 - Tries to keep the TV screensaver off while the page is open.
 
@@ -28,6 +29,7 @@ Edit the `CONFIG` object at the top of `inject.js`:
 | `hideTizenGlobals` | `false` | Hide `window.tizen`/`webapis` from the page |
 | `trySetHttpUserAgent` | `false` | Also change the HTTP User-Agent via `tizen.websetting` (reloads once) |
 | `keepScreenOn` | `true` | Try to disable the TV screensaver |
+| `reloadOnceIfLate` | `true` | Reload once if the script was injected after the page was parsed |
 | `overlay.autoShowMs` | `20000` | Show diagnostics this long after page load (`0` = off) |
 
 ## License
