@@ -1,5 +1,5 @@
 /*
- * gfn-tizen-desktop v0.1.2 — TizenBrew mods-modul (MIT)
+ * gfn-tizen-desktop v0.1.3 — TizenBrew mods-modul (MIT)
  *
  * TizenBrew kör den här filen med CDP Runtime.evaluate så fort varje nytt
  * dokument skapar sin JS-kontext. Det sker asynkront, så sidans tidigaste skript
@@ -33,7 +33,7 @@
   };
   var lateInjection = injectedAt.readyState !== 'loading';
 
-  var VERSION = '0.1.2';
+  var VERSION = '0.1.3';
 
   var CONFIG = {
     spoof: true,                    // utge sig för att vara Chrome på Windows
@@ -42,6 +42,7 @@
     windowsPlatformVersion: '15.0.0', // motsvarar Windows 11 i client hints
     keepScreenOn: true,             // försök stänga av TV:ns skärmsläckare
     reloadOnceIfLate: true,         // ladda om sidan en gång om injektionen kom efter att sidan tolkats
+    reloadHosts: ['play.geforcenow.com'], // bara här; aldrig på inloggningssidor (OAuth-koder gäller en gång)
     cursor: {
       enabled: true,                // rita en egen muspekare (TizenBrew visar ingen)
       hideAfterMs: 5000             // göm den när musen varit stilla så här länge (0 = aldrig)
@@ -512,7 +513,11 @@
 
   // Sen injektion: sidans skript kan redan ha läst av webbläsaren. Ladda om en
   // gång per flik och origin; nästa gång ligger modulen i TizenBrews cache.
-  if (CONFIG.reloadOnceIfLate && isTop && lateInjection && !reloadedForLateness()) {
+  // Bara på GFN-sidan och aldrig med inloggningsparametrar i adressen: en
+  // omladdning av NVIDIA:s callback återanvänder en engångskod och ger svart sida.
+  var reloadAllowed = CONFIG.reloadHosts.indexOf(location.hostname) !== -1 &&
+    !/[?&#](code|state|token|id_token|access_token)=/.test(location.href);
+  if (CONFIG.reloadOnceIfLate && isTop && lateInjection && reloadAllowed && !reloadedForLateness()) {
     try {
       sessionStorage.setItem('gfnTizenLateReload', '1');
       try { console.log('[gfn-tizen] sen injektion (' + injectedAt.readyState + '), laddar om en gång'); } catch (e) { /* ignorera */ }
