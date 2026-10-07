@@ -1,7 +1,7 @@
 {
   "name": "gfn-tizen-desktop",
   "appName": "GFN Desktop",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Runs the GeForce NOW web client on a Samsung Tizen TV as desktop Chrome on Windows, with a diagnostics panel, mouse-drag repair and an optional 4K override. Unofficial, personal use.",
   "packageType": "mods",
   "websiteURL": "https://play.geforcenow.com/robots.txt",

@@ -1,5 +1,5 @@
 /*
- * gfn-tizen-desktop v0.3.0 — TizenBrew "mods" module (MIT)
+ * gfn-tizen-desktop v0.3.1 — TizenBrew "mods" module (MIT)
  *
  * Runs the GeForce NOW web client (play.geforcenow.com) on a Samsung Tizen TV
  * while presenting itself as Chrome on Windows. The on-screen diagnostics
@@ -15,7 +15,8 @@
  * through robots.txt (rate limited, never with OAuth codes in the URL).
  *
  * Sections: config · state · log · identity · boot · webpack hook (GFN verdict,
- * 4K override) · WebRTC stats · mouse · overlay · events · start.
+ * 4K override, device modes) · WebRTC stats · mouse (pointer-lock keeper,
+ * drag trace) · overlay · events · start.
  *
  * It does not change games, automate input or touch HTTP headers.
  */
@@ -34,7 +35,7 @@
 
   /* ================================================================ config */
 
-  var VERSION = '0.3.0';
+  var VERSION = '0.3.1';
   var GFN_HOST = 'play.geforcenow.com';
   var GFN_APP_PATH = '/mall/';        // where GFN's index.html is served
   var BOOT_PATH = '/robots.txt';      // small text file on the GFN origin
@@ -49,15 +50,16 @@
     bootViaRobots: true,              // load GFN ourselves after the spoof (see header)
     windowsPlatformVersion: '15.0.0', // Windows 11 in client hints
     mouse: {
-      fix: true,                      // repair drags: synthesize missing button events
+      keepLock: true,                 // never let GFN re-lock an already locked stream (fixes drags)
       blockNativeDrag: true,          // no text selection / drag-and-drop in the stream
-      traceLength: 24                 // raw pointer events kept for the panel
+      traceLength: 24                 // raw mouse/lock events kept for the panel
     },
     force4k: {
       preferred: ['H265', 'AV1'],     // first codec the TV's WebRTC offers wins
       overrideData: 'force4kbrowser=1'
     },
     keys: { blue: 406, red: 403, green: 404 }, // ColorF3Blue, ColorF0Red, ColorF1Green
+    unsupportedWatchMs: 90000,        // look for "not supported" on GFN pages this long
     overlay: { autoShowMs: 20000, maxLogLines: 60, shownLogLines: 10 }
   };
 
@@ -91,16 +93,12 @@
   var stream = { text: '', lastAt: 0 };
   var mouse = {
     moves: 0, lastClick: null, lastKey: null,
-    trace: [], down: {},             // down[button] = { t, moves }
-    native: 0,                       // bitmask of buttons with a native mousedown seen
-    synth: 0,                        // bitmask of buttons we synthesized mousedown for
-    fixes: 0, swallowed: 0, lastDrag: '',
-    wheel: false, logged: 0,         // first few button events are logged verbosely
-    pending: {},                     // pending[button] = timer for a withheld release
-    lock: ''                         // last pointer lock event / error
+    trace: [], down: {},             // down[button] = { t, moves, dx, dy }
+    lastDrag: '', relocksKept: 0, lockChanges: 0,
+    lock: '',                        // last pointer lock state / error
+    wheel: false, logged: 0          // first few button events are logged verbosely
   };
-  var sdkId = null;                  // webpack module id of the Ragnarok SDK
-  var synthetic = (typeof WeakSet === 'function') ? new WeakSet() : null;
+  var deviceModes = '';              // SDK's supported stream modes (for 4K diagnosis)
   var overlay = { el: null, visible: false, hideTimer: null, pollTimer: null };
   var unsupportedSeen = false;
 
@@ -143,13 +141,14 @@
   }
 
   // OAuth codes must never end up in logs, photos or reboot targets.
+  // GFN also accepts "#/code=…" (getUrlAccessCode), hence the "/" separator.
   function stripAuth(url) {
-    return String(url).replace(/([?#&])([^#&=]+)=([^#&]*)/g, function (m, sep, key) {
+    return String(url).replace(/([?#&\/])([^#&=\/?]+)=([^#&]*)/g, function (m, sep, key) {
       return AUTH_PARAMS.indexOf(key.toLowerCase()) === -1 ? m : sep + key + '=…';
     });
   }
   function hasAuthParams(url) {
-    return new RegExp('[?&#](' + AUTH_PARAMS.join('|') + ')=', 'i').test(String(url));
+    return new RegExp('[?&#/](' + AUTH_PARAMS.join('|') + ')=', 'i').test(String(url));
   }
 
   /* ============================================================== identity */
@@ -345,7 +344,8 @@
               var opts = args[1];
               var isModule = !!(opts && typeof opts === 'object' && opts.type === 'module');
               keep[u] = true;
-              var body = prelude + (isModule ? 'import ' + JSON.stringify(u) + ';\n' : 'importScripts(' + JSON.stringify(u) + ');\n');
+              // A static import would be hoisted above the prelude; a dynamic one runs after it.
+              var body = prelude + (isModule ? 'await import(' + JSON.stringify(u) + ');\n' : 'importScripts(' + JSON.stringify(u) + ');\n');
               var wrapped = URL.createObjectURL(new Blob([body], { type: 'text/javascript' }));
               setTimeout(function () { realRevoke.call(URL, wrapped); }, 15000);
               args = [wrapped].concat(Array.prototype.slice.call(args, 1));
@@ -390,6 +390,7 @@
   }
 
   function rebootViaRobots(reason) {
+    if (!isGfnOrigin()) { log('omstart görs bara på ' + GFN_HOST); return false; }
     if (!rebootAllowed()) {
       log('för många omstarter – fortsätter utan (' + reason + ')');
       return false;
@@ -443,29 +444,23 @@
 
   // GFN's webpack runtime does: t = self.webpackChunkgfn_mall = self.webpackChunkgfn_mall || [];
   // t.push = n.bind(...). A pre-created array with an accessor "push" catches that
-  // assignment, so every chunk registration can be observed. When the chunk that
-  // defines the Ragnarok SDK arrives, a chunk of our own obtains webpack's require,
-  // loads the SDK exports and applies the 4K override before GFN reads capabilities.
+  // assignment, so every chunk registration passes through us first. The chunk
+  // defining the Ragnarok SDK gets its factory wrapped: when GFN itself imports
+  // the SDK (before it reads device capabilities), we receive the exports and
+  // apply the 4K override. Nothing is executed early, so webpack's module cache
+  // stays exactly as GFN would build it.
   function installWebpackHook() {
-    if (typeof Proxy !== 'function' || Object.prototype.hasOwnProperty.call(self, 'webpackChunkgfn_mall')) { return; }
+    if (Object.prototype.hasOwnProperty.call(self, 'webpackChunkgfn_mall')) { return; }
     var arr = [];
     var runtimePush = null;
-    var hookCount = 0;
-    function wrappedPush(chunk) {
-      var result = runtimePush.apply(arr, arguments);
-      try { onChunk(chunk); } catch (e) { log('webpack-hook: ' + e.message); }
-      return result;
+    function inspect(chunk) {
+      try { if (!sdk && chunk && chunk[1] && typeof chunk[1] === 'object') { wrapSdkFactory(chunk[1]); } } catch (e) { log('webpack-hook: ' + e.message); }
     }
-    function onChunk(chunk) {
-      if (sdk || !chunk || !chunk[1] || typeof chunk[1] !== 'object') { return; }
-      if (!sdkId) { sdkId = findSdkId(chunk[1]); }
-      if (!sdkId) { return; }
-      hookCount += 1;
-      arr.push([['gfn-tizen-hook-' + hookCount], {}, function (req) { adoptSdk(req, sdkId); }]);
-    }
+    function earlyPush() { Array.prototype.forEach.call(arguments, inspect); return Array.prototype.push.apply(arr, arguments); }
+    function hookedPush(chunk) { inspect(chunk); return runtimePush.apply(arr, arguments); }
     Object.defineProperty(arr, 'push', {
       configurable: true, enumerable: false,
-      get: function () { return runtimePush ? wrappedPush : Array.prototype.push; },
+      get: function () { return runtimePush ? hookedPush : earlyPush; },
       set: function (fn) { runtimePush = fn; }
     });
     self.webpackChunkgfn_mall = arr;
@@ -478,11 +473,19 @@
     })[0] || null;
   }
 
-  // Load the SDK exports through webpack's require. Throws if a dependency is
-  // not registered yet; the hook simply tries again on the next chunk.
-  function adoptSdk(req, id) {
-    var R = req(id);
-    if (!R || typeof R.ConfigureRagnarokSettings !== 'function') { throw new Error('modul ' + id + ' saknar ConfigureRagnarokSettings'); }
+  function wrapSdkFactory(modules) {
+    var id = findSdkId(modules);
+    if (!id) { return; }
+    var factory = modules[id];
+    modules[id] = function (module) {
+      var result = factory.apply(this, arguments);
+      try { adoptSdk(module && module.exports, id); } catch (e) { log('SDK-krok: ' + e.message); }
+      return result;
+    };
+  }
+
+  function adoptSdk(R, id) {
+    if (sdk || !R || typeof R.ConfigureRagnarokSettings !== 'function') { return; }
     sdk = R;
     log('GFN:s SDK hittad (modul ' + id + ')');
     applyForce4k();
@@ -493,8 +496,8 @@
     var q = self.webpackChunkgfn_mall;
     if (sdk || !q || typeof q.push !== 'function') { return; }
     q.push([['gfn-tizen-late-probe'], {}, function (req) {
-      var id = sdkId || findSdkId(req.m || {});
-      if (id) { adoptSdk(req, id); }
+      var id = findSdkId(req.m || {});
+      if (id) { adoptSdk(req(id), id); }
     }]);
   }
 
@@ -523,7 +526,7 @@
     try {
       sdk.ConfigureRagnarokSettings({ overrideData: data });
       force4k.codec = codec;
-      force4k.applied = 'aktivt (' + data + ')';
+      force4k.applied = 'aktivt (' + data + '; syns i GFN:s loggar)';
       log('4K-läge aktivt: ' + data + ' – välj Custom → 3840×2160 i GFN:s inställningar');
     } catch (e) {
       force4k.applied = 'fel: ' + e.message;
@@ -532,6 +535,7 @@
   }
 
   function toggleForce4k() {
+    if (!isGfnOrigin()) { log('4K-läget kan bara ändras på ' + GFN_HOST); return; }
     var next = !force4k.wanted;
     try { localStorage.setItem(STORAGE.force4k, next ? '1' : '0'); } catch (e) { log('kan inte spara 4K-valet: ' + e.message); return; }
     force4k.wanted = next;
@@ -562,10 +566,21 @@
           'strömning ' + (ok === true ? 'ja' : ok === false ? 'NEJ' : ok)
         ].filter(Boolean).join(', ');
         log('GFN-beslut: ' + verdict);
+        readDeviceModes(d);
       }, function (e) { verdict = 'fel: ' + e; });
     } catch (e) {
       verdict = 'fel: ' + e.message;
     }
+  }
+
+  // What the SDK says this device can decode; 4K must appear here before GFN's
+  // settings can offer it (the server's tier list decides the rest).
+  function readDeviceModes(details) {
+    if (!sdk || typeof sdk.GetDeviceCapabilities !== 'function') { return; }
+    Promise.resolve(sdk.GetDeviceCapabilities(details)).then(function (c) {
+      deviceModes = ((c && c.maxSupportedModes) || []).map(function (m) { return m.width + '×' + m.height + '@' + m.fps; }).join(', ') || 'inga';
+      log('SDK-lägen: ' + deviceModes);
+    }, function (e) { deviceModes = 'fel: ' + (e && e.message); });
   }
 
   /* ========================================================== WebRTC stats */
@@ -587,11 +602,13 @@
   }
 
   function activePeer() {
+    var rank = { connected: 3, connecting: 2, 'new': 1 };
+    var best = null, bestRank = 0;
     for (var i = peers.length - 1; i >= 0; i--) {
-      var s = peers[i].connectionState;
-      if (s === 'connected' || s === 'connecting' || s === 'new') { return peers[i]; }
+      var r = rank[peers[i].connectionState] || 0;
+      if (r > bestRank) { best = peers[i]; bestRank = r; }
     }
-    return null;
+    return best;
   }
 
   function ms(x) { return x === undefined ? '?' : Math.round(x * 1000) + ' ms'; }
@@ -626,38 +643,50 @@
 
   /* ================================================================= mouse */
 
+  // Why drags failed on the TV (verified 2026-10-08 from a panel photo and the
+  // SDK source): GFN's SDK calls requestPointerLock again whenever the game shows
+  // or hides its cursor, because it wants unadjustedMovement only while the
+  // cursor is hidden (Ep(): g = tp && !cursorVisible; re-request if g !== sp).
+  // WoW hides the cursor the moment a drag starts. Tizen turns that re-request
+  // into unlock + relock, and the unlock releases the held button (~60 ms in).
+  // While the stream video already holds the lock we answer "locked" ourselves.
+  function patchPointerLock() {
+    var proto = window.Element && Element.prototype;
+    if (!proto || typeof proto.requestPointerLock !== 'function') { return; }
+    var realLock = proto.requestPointerLock;
+    proto.requestPointerLock = function () {
+      if (CONFIG.mouse.keepLock && document.pointerLockElement === this) {
+        mouse.relocksKept += 1;
+        traceNote('relås behållet');
+        return Promise.resolve();
+      }
+      var r;
+      try {
+        r = realLock.apply(this, arguments);
+      } catch (e) {
+        mouse.lock = 'kastade ' + e.name;
+        log('requestPointerLock kastade ' + e.name + ': ' + e.message);
+        throw e;
+      }
+      if (r && typeof r.then === 'function') {
+        r.then(function () { mouse.lock = 'låst'; }, function (e) {
+          mouse.lock = 'avvisad: ' + (e && e.name);
+          log('requestPointerLock avvisad: ' + (e && e.name) + ' ' + trunc(e && e.message, 80));
+        });
+      }
+      return r;
+    };
+  }
+
   function streamVideo() { return document.getElementById('remote-video'); }
-  function isSynthetic(e) { return !!(synthetic && synthetic.has(e)); }
-  function buttonBit(button) { return button === 0 ? 1 : button === 2 ? 2 : button === 1 ? 4 : button === 3 ? 8 : button === 4 ? 16 : 0; }
-  function bitButton(bit) { return bit === 1 ? 0 : bit === 2 ? 2 : bit === 4 ? 1 : bit === 8 ? 3 : 4; }
 
-  function trace(e, note) {
+  function traceRecord(r) {
     if (mouse.trace.length >= CONFIG.mouse.traceLength) { mouse.trace.shift(); }
-    mouse.trace.push({
-      t: Math.round(e.timeStamp), type: e.type, button: e.button, buttons: e.buttons,
-      dx: e.movementX, dy: e.movementY, x: e.clientX, y: e.clientY,
-      target: e.target && e.target.tagName ? e.target.tagName.toLowerCase() + (e.target.id ? '#' + e.target.id : '') : '?',
-      trusted: e.isTrusted, note: note || ''
-    });
+    mouse.trace.push(r);
   }
-
-  // Dispatch a mouse event the way the SDK's listeners on #remote-video expect it.
-  function synthesize(type, button, from, target) {
-    var ev = new MouseEvent(type, {
-      bubbles: true, cancelable: true, composed: true, view: window,
-      button: button, buttons: from.buttons,
-      clientX: from.clientX, clientY: from.clientY, screenX: from.screenX, screenY: from.screenY,
-      movementX: 0, movementY: 0,
-      ctrlKey: from.ctrlKey, shiftKey: from.shiftKey, altKey: from.altKey, metaKey: from.metaKey
-    });
-    if (synthetic) { synthetic.add(ev); }
-    mouse.fixes += 1;
-    (target || from.target || document).dispatchEvent(ev);
-  }
-
-  function describeDrag(button, info, endReason) {
-    var held = Math.round(performance.now() - info.t);
-    mouse.lastDrag = 'knapp ' + button + ': ' + info.moves + ' rörelser (' + info.dx + ',' + info.dy + ' px) under ' + held + ' ms → ' + endReason;
+  function traceNote(note) { traceRecord({ type: note }); }
+  function trace(e) {
+    traceRecord({ type: e.type, button: e.button, buttons: e.buttons, dx: e.movementX, dy: e.movementY, trusted: e.isTrusted });
   }
 
   function noteButton(text) {
@@ -666,111 +695,46 @@
     else if (mouse.logged === 13) { log('(fler musknappshändelser loggas inte; se raden Mushändelser)'); }
   }
 
-  function clearPending(button) {
-    if (mouse.pending[button]) { clearTimeout(mouse.pending[button]); delete mouse.pending[button]; }
-  }
-
   function onMouseDown(e) {
-    if (isSynthetic(e)) { trace(e, 'synt'); return; }
-    var bit = buttonBit(e.button);
-    clearPending(e.button);
-    // A native press for a button we already synthesized: keep the bookkeeping,
-    // but do not let the SDK see a second press.
-    if (mouse.synth & bit) {
-      trace(e, 'dubblett');
-      mouse.synth &= ~bit;
-      mouse.native |= bit;
-      e.stopImmediatePropagation();
-      return;
-    }
     trace(e);
-    mouse.native |= bit;
     mouse.down[e.button] = { t: performance.now(), moves: 0, dx: 0, dy: 0 };
     mouse.lastClick = describe(e.target) + ' @' + e.clientX + ',' + e.clientY;
     noteButton('musknapp ' + e.button + ' ned (buttons=' + e.buttons + ') på ' + mouse.lastClick);
   }
 
-  function finishButton(button, reason) {
-    var bit = buttonBit(button);
-    mouse.native &= ~bit;
-    mouse.synth &= ~bit;
-    var info = mouse.down[button];
-    if (info) { describeDrag(button, info, reason); delete mouse.down[button]; }
-  }
-
   function onMouseUp(e) {
-    if (isSynthetic(e)) { trace(e, 'synt'); return; }
-    var bit = buttonBit(e.button);
-    // Quirk guard: a release reported while the bitmask still says "held" is
-    // withheld. If no movement confirms the hold within 400 ms, the release is
-    // delivered anyway, so a button can never stay stuck.
-    if (CONFIG.mouse.fix && (e.buttons & bit) && streamVideo()) {
-      trace(e, 'svald');
-      mouse.swallowed += 1;
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      armPendingRelease(e);
-      return;
-    }
     trace(e);
-    clearPending(e.button);
-    finishButton(e.button, 'släppt');
+    var info = mouse.down[e.button];
+    if (info) {
+      mouse.lastDrag = 'knapp ' + e.button + ': ' + info.moves + ' rörelser (' + info.dx + ',' + info.dy + ' px) under ' +
+        Math.round(performance.now() - info.t) + ' ms';
+      delete mouse.down[e.button];
+    }
     noteButton('musknapp ' + e.button + ' upp (buttons=' + e.buttons + ')');
   }
 
-  function armPendingRelease(e) {
-    clearPending(e.button);
-    var snapshot = { buttons: e.buttons & ~buttonBit(e.button), clientX: e.clientX, clientY: e.clientY, screenX: e.screenX, screenY: e.screenY };
-    mouse.pending[e.button] = setTimeout(function () {
-      delete mouse.pending[e.button];
-      if (!(mouse.native & buttonBit(e.button))) { return; }
-      finishButton(e.button, 'släppt efter väntan');
-      synthesize('mouseup', e.button, snapshot, streamVideo());
-    }, 400);
-  }
-
-  function onMove(e) {
-    if (isSynthetic(e)) { return; }
+  // One physical motion fires mousemove, pointermove and pointerrawupdate;
+  // only mousemove is counted.
+  function onMouseMove(e) {
     mouse.moves += 1;
     if (mouse.moves === 1) { log('första mushändelse (' + e.clientX + ',' + e.clientY + ')'); }
-    Object.keys(mouse.down).forEach(function (b) {
+    var held = Object.keys(mouse.down);
+    if (!held.length && !e.buttons) { return; }
+    held.forEach(function (b) {
       var info = mouse.down[b];
       info.moves += 1;
       info.dx += e.movementX || 0;
       info.dy += e.movementY || 0;
     });
-    var involved = e.buttons || mouse.native || mouse.synth;
-    if (!involved) { return; }
-    if (e.type !== 'pointerrawupdate') { trace(e); }
-    // Movement with the button still held confirms a withheld release was spurious.
-    Object.keys(mouse.pending).forEach(function (b) { if (e.buttons & buttonBit(+b)) { armPendingRelease({ button: +b, buttons: e.buttons, clientX: e.clientX, clientY: e.clientY, screenX: e.screenX, screenY: e.screenY }); } });
-    if (!CONFIG.mouse.fix || !streamVideo()) { return; }
-    // Reconcile: bits present in the bitmask without a mousedown get one;
-    // bits we synthesized that disappeared get a mouseup.
-    var known = mouse.native | mouse.synth;
-    var missing = e.buttons & ~known;
-    var released = mouse.synth & ~e.buttons;
-    var video = streamVideo();
-    [1, 2, 4].forEach(function (bit) {
-      if (missing & bit) {
-        mouse.synth |= bit;
-        mouse.down[bitButton(bit)] = { t: performance.now(), moves: 0, dx: 0, dy: 0 };
-        log('drag-fix: syntetisk knapp ' + bitButton(bit) + ' ned (buttons=' + e.buttons + ')');
-        synthesize('mousedown', bitButton(bit), e, video);
-      }
-      if (released & bit) {
-        finishButton(bitButton(bit), 'syntetiskt släppt');
-        synthesize('mouseup', bitButton(bit), e, video);
-      }
-    });
+    trace(e);
   }
 
   function installMouseListeners() {
     window.addEventListener('mousedown', onMouseDown, true);
     window.addEventListener('mouseup', onMouseUp, true);
-    ['mousemove', 'pointermove', 'pointerrawupdate'].forEach(function (t) { window.addEventListener(t, onMove, true); });
-    ['pointerdown', 'pointerup', 'pointercancel', 'lostpointercapture', 'dragstart', 'drag', 'dragend', 'auxclick', 'contextmenu'].forEach(function (t) {
-      window.addEventListener(t, function (e) { trace(e); }, true);
+    window.addEventListener('mousemove', onMouseMove, true);
+    ['pointercancel', 'lostpointercapture', 'dragstart', 'auxclick', 'contextmenu'].forEach(function (t) {
+      window.addEventListener(t, trace, true);
     });
     window.addEventListener('wheel', function (e) { if (!mouse.wheel) { mouse.wheel = true; log('hjul: deltaY ' + e.deltaY); } }, { capture: true, passive: true });
     if (CONFIG.mouse.blockNativeDrag) {
@@ -779,24 +743,16 @@
       });
     }
     document.addEventListener('pointerlockchange', function () {
+      mouse.lockChanges += 1;
       mouse.lock = document.pointerLockElement ? 'låst (' + describe(document.pointerLockElement) + ')' : 'olåst';
+      traceNote(document.pointerLockElement ? 'LÅST' : 'OLÅST');
       log('pointer lock ' + mouse.lock);
     });
-    document.addEventListener('pointerlockerror', function () { mouse.lock = 'FEL vid låsning'; log('pointer lock misslyckades'); });
-    // Surface the rejection reason the SDK would otherwise swallow.
-    var proto = window.Element && Element.prototype;
-    if (proto && typeof proto.requestPointerLock === 'function') {
-      var realLock = proto.requestPointerLock;
-      proto.requestPointerLock = function () {
-        var r;
-        try { r = realLock.apply(this, arguments); } catch (e) { mouse.lock = 'kastade ' + e.name; log('requestPointerLock kastade ' + e.name + ': ' + e.message); throw e; }
-        if (r && typeof r.then === 'function') {
-          r.then(function () { mouse.lock = 'låst'; }, function (e) { mouse.lock = 'avvisad: ' + (e && e.name); log('requestPointerLock avvisad: ' + (e && e.name) + ' ' + (e && e.message)); });
-          r.catch(function () {});
-        }
-        return r;
-      };
-    }
+    document.addEventListener('pointerlockerror', function () {
+      mouse.lock = 'FEL vid låsning';
+      traceNote('LÅSFEL');
+      log('pointer lock misslyckades');
+    });
   }
 
   function mouseText() {
@@ -804,18 +760,19 @@
     var held = Object.keys(mouse.down).map(function (b) { return 'knapp ' + b + ' hålls (' + mouse.down[b].moves + ' rörelser)'; });
     return [
       mouse.moves + ' rörelser',
-      'native=' + mouse.native + ' synt=' + mouse.synth,
       held.join(', '),
-      mouse.lastDrag ? 'senaste drag: ' + mouse.lastDrag : '',
-      'fixar ' + mouse.fixes + ', svalda släpp ' + mouse.swallowed,
+      mouse.lastDrag ? 'senaste tryck: ' + mouse.lastDrag : '',
+      'relås behållna ' + mouse.relocksKept + (CONFIG.mouse.keepLock ? '' : ' (AV)'),
+      'låsbyten ' + mouse.lockChanges,
       mouse.lock ? 'lås ' + mouse.lock : ''
     ].filter(Boolean).join(' · ');
   }
 
   function traceText() {
-    return mouse.trace.slice(-8).map(function (r) {
-      return r.type.replace('pointerrawupdate', 'raw') + (r.button !== undefined && /down|up|click|menu/.test(r.type) ? '(' + r.button + ')' : '') +
-        ' b=' + r.buttons + (r.dx || r.dy ? ' d=' + r.dx + ',' + r.dy : '') + (r.note ? ' ' + r.note : '') + (r.trusted ? '' : ' !');
+    return mouse.trace.slice(-10).map(function (r) {
+      if (r.button === undefined) { return r.type; }
+      return r.type + (/down|up|click|menu/.test(r.type) ? '(' + r.button + ')' : '') +
+        ' b=' + r.buttons + (r.dx || r.dy ? ' d=' + r.dx + ',' + r.dy : '') + (r.trusted ? '' : ' !');
     }).join('  ');
   }
 
@@ -868,16 +825,14 @@
     }
   }
 
-  // Short description of an element, never form field values.
+  // Short description of an element: tag, id, first class. Never text or values
+  // (GFN's account button shows the user name; login pages show the e-mail).
   function describe(t) {
     if (!t || !t.tagName) { return '?'; }
     var tag = t.tagName.toLowerCase();
     var s = tag + (t.id ? '#' + trunc(t.id, 24) : '');
+    if (typeof t.className === 'string' && t.className.trim()) { s += '.' + trunc(t.className.trim().split(/\s+/)[0], 24); }
     if (t.type && /^(input|button)$/.test(tag)) { s += '[' + t.type + ']'; }
-    if (!/^(input|textarea|select|video|canvas)$/.test(tag)) {
-      var txt = String(t.innerText || t.textContent || '').replace(/\s+/g, ' ').trim();
-      if (txt) { s += ' "' + trunc(txt, 20) + '"'; }
-    }
     return s;
   }
 
@@ -891,14 +846,15 @@
   function diagText() {
     refreshStreamStats();
     var lines = [
-      'GFN Desktop för Tizen v' + VERSION + '   [blå: visa/dölj · röd: 4K-läge · grön: drag-fix]   klocka ' + tzLabel(),
+      'GFN Desktop för Tizen v' + VERSION + '   [blå: visa/dölj · röd: 4K-läge · grön: låsvakt]   klocka ' + tzLabel(),
       'Sida:           ' + location.host + trunc(location.pathname, 60),
       'Start:          ' + (startNote || ('direkt, injicerad ' + injectedAt.ms + ' ms, ' + injectedAt.readyState +
         ', ' + injectedAt.scripts + ' skript före' + (lateInjection ? ' – SEN' : ' – tidig'))),
       'GFN-beslut:     ' + (verdict || 'väntar…'),
       'Ström:          ' + (stream.text || 'ingen aktiv ström'),
       '4K-läge:        ' + (force4k.wanted ? 'PÅ – ' + (force4k.applied || 'väntar på GFN:s SDK') : 'av') + ' · codecs ' + getVideoCodecs(),
-      'Mus:            ' + mouseText() + (CONFIG.mouse.fix ? '' : ' · drag-fix AV'),
+      'SDK-lägen:      ' + (deviceModes || 'väntar…'),
+      'Mus:            ' + mouseText(),
       'Mushändelser:   ' + (mouse.trace.length ? traceText() : '–'),
       'Tangent:        ' + (mouse.lastKey || '–'),
       'Handkontroller: ' + gamepadText(),
@@ -955,19 +911,22 @@
   }
 
   function watchForUnsupportedText() {
-    var checks = 0;
+    if (!isGfnOrigin()) { return; }
+    var started = Date.now();
     var timer = setInterval(function () {
-      checks += 1;
+      if (unsupportedSeen || Date.now() - started > CONFIG.unsupportedWatchMs) { clearInterval(timer); return; }
+      if (!document.body || streamVideo()) { return; }
       try {
-        var text = document.body ? (document.body.innerText || '') : '';
-        var m = /.{0,60}(not supported|unsupported|stöds inte).{0,60}/i.exec(text);
-        if (m && !unsupportedSeen) {
+        var text = Array.prototype.map.call(document.body.children, function (el) {
+          return el === overlay.el ? '' : (el.innerText || '');
+        }).join(' ');
+        var m = /(not supported|unsupported|stöds inte)/i.exec(text);
+        if (m) {
           unsupportedSeen = true;
-          log('Sidan säger att något inte stöds: "' + m[0].replace(/\s+/g, ' ') + '"');
+          log('Sidan säger att något inte stöds ("' + m[1] + '")');
           showOverlay(0);
         }
       } catch (e) { /* ignore */ }
-      if (checks >= 18 || unsupportedSeen) { clearInterval(timer); }
     }, 5000);
   }
 
@@ -1014,8 +973,8 @@
         toggleForce4k();
       } else if (e.keyCode === CONFIG.keys.green) {
         e.preventDefault(); e.stopImmediatePropagation();
-        CONFIG.mouse.fix = !CONFIG.mouse.fix;
-        log('drag-fix ' + (CONFIG.mouse.fix ? 'PÅ' : 'AV'));
+        CONFIG.mouse.keepLock = !CONFIG.mouse.keepLock;
+        log('låsvakt ' + (CONFIG.mouse.keepLock ? 'PÅ' : 'AV (för jämförelse)'));
         showOverlay(0);
       }
     }, true);
@@ -1048,6 +1007,7 @@
     force4k.wanted = force4kWanted();
     installWebpackHook();
     patchPeerConnection();
+    patchPointerLock();
   }
 
   if (CONFIG.bootViaRobots && isBootDocument()) {
