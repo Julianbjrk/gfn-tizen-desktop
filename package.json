@@ -1,7 +1,7 @@
 {
   "name": "gfn-tizen-desktop",
   "appName": "GFN Desktop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Opens the GeForce NOW web client on a Samsung Tizen TV, identifying as desktop Chrome on Windows. Unofficial, personal use.",
   "packageType": "mods",
   "websiteURL": "https://play.geforcenow.com/",

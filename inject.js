@@ -1,5 +1,5 @@
 /*
- * gfn-tizen-desktop v0.1.1 — TizenBrew mods-modul (MIT)
+ * gfn-tizen-desktop v0.1.2 — TizenBrew mods-modul (MIT)
  *
  * TizenBrew kör den här filen med CDP Runtime.evaluate så fort varje nytt
  * dokument skapar sin JS-kontext. Det sker asynkront, så sidans tidigaste skript
@@ -14,6 +14,8 @@
  *      (navigator.userAgent, userAgentData, platform, vendor).
  *   2. Visar en diagnostikruta på TV:n (blå knapp på fjärrkontrollen), eftersom
  *      det inte går att ansluta DevTools medan TizenBrew använder debug-porten.
+ *   3. Ritar en egen muspekare, eftersom TV:n inte visar någon inne i TizenBrew.
+ *      Den göms när musen är stilla och när spelet låser musen (pointer lock).
  *
  * Vad den INTE gör: ändrar inget i spelet, automatiserar ingenting, rör inga
  * HTTP-headers (JS kan inte det; se CLAUDE.md, experiment E4).
@@ -31,7 +33,7 @@
   };
   var lateInjection = injectedAt.readyState !== 'loading';
 
-  var VERSION = '0.1.1';
+  var VERSION = '0.1.2';
 
   var CONFIG = {
     spoof: true,                    // utge sig för att vara Chrome på Windows
@@ -40,6 +42,10 @@
     windowsPlatformVersion: '15.0.0', // motsvarar Windows 11 i client hints
     keepScreenOn: true,             // försök stänga av TV:ns skärmsläckare
     reloadOnceIfLate: true,         // ladda om sidan en gång om injektionen kom efter att sidan tolkats
+    cursor: {
+      enabled: true,                // rita en egen muspekare (TizenBrew visar ingen)
+      hideAfterMs: 5000             // göm den när musen varit stilla så här länge (0 = aldrig)
+    },
     overlay: {
       autoShowMs: 20000,            // visa rutan automatiskt så länge efter sidladdning (0 = av)
       toggleKeyCode: 406,           // blå knapp (ColorF3Blue)
@@ -51,7 +57,8 @@
   var isTop = (function () { try { return window.top === window; } catch (e) { return false; } })();
   var nav = window.navigator;
   var realUA = String(nav.userAgent || '');
-  var chromeMatch = /Chrome\/(\d+)(?:\.(\d+\.\d+\.\d+))?/.exec(realUA);
+  // Tizen 9 skriver "(KHTML, like Gecko) 120.0.6099.5/9.0 TV" utan "Chrome/".
+  var chromeMatch = /(?:Chrome\/|like Gecko\) )(\d+)(?:\.(\d+\.\d+\.\d+))?/.exec(realUA);
   var major = chromeMatch ? chromeMatch[1] : '120';
   var fullVersion = (chromeMatch && chromeMatch[2]) ? (major + '.' + chromeMatch[2]) : (major + '.0.0.0');
   var spoofUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -61,6 +68,8 @@
   var logLines = [];
   var overlay = { el: null, visible: false, hideTimer: null, pollTimer: null };
   var unsupportedSeen = false;
+  var input = { moves: 0, lastMouse: null, lastClick: null, lastKey: null };
+  var cursor = { el: null, hideTimer: null };
 
   window.__gfnTizenDesktop = {
     version: VERSION,
@@ -284,6 +293,12 @@
       'WebRTC:         ' + (window.RTCPeerConnection ? 'finns' : 'SAKNAS'),
       'Videocodecs:    ' + getVideoCodecs(),
       'Handkontroller: ' + gamepadText(),
+      'Mus:            ' + (input.moves
+        ? input.moves + ' rörelser, senast ' + input.lastMouse.x + ',' + input.lastMouse.y +
+          (document.pointerLockElement ? ' (låst av spelet)' : '')
+        : 'inga mushändelser än') +
+        (input.lastClick ? ', klick: ' + input.lastClick : ''),
+      'Tangent:        ' + (input.lastKey || '–'),
       'Tizen-API:      tizen ' + (tizenApi() ? 'ja' : 'nej') + ', webapis ' + (webApis() ? 'ja' : 'nej') +
         (CONFIG.hideTizenGlobals ? ' (dolda för sidan)' : ''),
       'Fönster:        ' + window.innerWidth + '×' + window.innerHeight + ' @' + (window.devicePixelRatio || 1) +
@@ -350,6 +365,72 @@
     }, 5000);
   }
 
+  /* ------------------------------------------------------------ muspekare */
+
+  function ensureCursor() {
+    if (cursor.el) { return cursor.el; }
+    if (!document.body) { return null; }
+    // Byggs med DOM-anrop (inte innerHTML) så att det fungerar även med Trusted Types.
+    var ns = 'http://www.w3.org/2000/svg';
+    var el = document.createElement('div');
+    el.id = 'gfn-tizen-cursor';
+    el.style.cssText = [
+      'position:fixed', 'left:0', 'top:0', 'width:28px', 'height:28px', 'z-index:2147483647',
+      'pointer-events:none', 'display:none', 'will-change:transform'
+    ].join(';');
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', '28');
+    svg.setAttribute('height', '28');
+    svg.setAttribute('viewBox', '0 0 28 28');
+    var path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', 'M2 2 L2 22 L7.5 16.8 L11.5 25.5 L15.3 23.8 L11.4 15.3 L19 15.3 Z');
+    path.setAttribute('fill', '#fff');
+    path.setAttribute('stroke', '#000');
+    path.setAttribute('stroke-width', '1.6');
+    path.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(path);
+    el.appendChild(svg);
+    document.body.appendChild(el);
+    cursor.el = el;
+    return el;
+  }
+
+  function hideCursor() {
+    clearTimeout(cursor.hideTimer);
+    if (cursor.el) { cursor.el.style.display = 'none'; }
+  }
+
+  function showCursorAt(x, y) {
+    if (!CONFIG.cursor.enabled) { return; }
+    if (document.pointerLockElement) { hideCursor(); return; }
+    var el = ensureCursor();
+    if (!el) { return; }
+    el.style.transform = 'translate(' + (x - 2) + 'px,' + (y - 2) + 'px)';
+    el.style.display = 'block';
+    clearTimeout(cursor.hideTimer);
+    if (CONFIG.cursor.hideAfterMs) { cursor.hideTimer = setTimeout(hideCursor, CONFIG.cursor.hideAfterMs); }
+  }
+
+  // Kort beskrivning av ett klickat element, utan värden från formulärfält.
+  function describe(t) {
+    if (!t || !t.tagName) { return '?'; }
+    var s = t.tagName.toLowerCase();
+    if (t.id) { s += '#' + trunc(t.id, 24); }
+    if (t.type && /^(input|button)$/.test(s.split('#')[0])) { s += '[' + t.type + ']'; }
+    if (!/^(input|textarea|select)/.test(s)) {
+      var txt = String(t.innerText || t.textContent || '').replace(/\s+/g, ' ').trim();
+      if (txt) { s += ' "' + trunc(txt, 24) + '"'; }
+    }
+    return s;
+  }
+
+  // Tangentnamn utan att avslöja vad som skrivs: tecken visas bara som "tecken".
+  function keyName(e) {
+    var k = e.key;
+    if (k && k.length === 1) { return 'tecken'; }
+    return (k || 'okänd') + ' (' + e.keyCode + ')';
+  }
+
   /* ------------------------------------------------------------ händelser */
 
   function installListeners() {
@@ -373,6 +454,35 @@
     window.addEventListener('gamepaddisconnected', function (e) {
       log('handkontroll frånkopplad: ' + e.gamepad.id);
     });
+
+    window.addEventListener('mousemove', function (e) {
+      if (!input.moves) { log('första mushändelse (' + e.clientX + ',' + e.clientY + ')'); }
+      input.moves += 1;
+      input.lastMouse = { x: e.clientX, y: e.clientY };
+      showCursorAt(e.clientX, e.clientY);
+    }, true);
+
+    window.addEventListener('mousedown', function (e) {
+      input.lastClick = describe(e.target) + ' @' + e.clientX + ',' + e.clientY;
+      if (!input.moves) { input.lastMouse = { x: e.clientX, y: e.clientY }; }
+      log('klick: ' + input.lastClick);
+      showCursorAt(e.clientX, e.clientY);
+    }, true);
+
+    // Pekaren lämnar dokumentet (eller går in i en iframe som ritar sin egen).
+    document.addEventListener('mouseout', function (e) {
+      if (!e.relatedTarget) { hideCursor(); }
+    }, true);
+
+    document.addEventListener('pointerlockchange', function () {
+      var locked = !!document.pointerLockElement;
+      if (locked) { hideCursor(); }
+      log('pointer lock ' + (locked ? 'på' : 'av'));
+    });
+
+    window.addEventListener('keydown', function (e) {
+      input.lastKey = keyName(e);
+    }, true);
 
     if (isTop) {
       window.addEventListener('keydown', function (e) {
