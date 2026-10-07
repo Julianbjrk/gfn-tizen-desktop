@@ -1,24 +1,29 @@
 /*
- * gfn-tizen-desktop v0.1.3 — TizenBrew mods-modul (MIT)
+ * gfn-tizen-desktop v0.2.0 — TizenBrew mods-modul (MIT)
  *
- * TizenBrew kör den här filen med CDP Runtime.evaluate så fort varje nytt
- * dokument skapar sin JS-kontext. Det sker asynkront, så sidans tidigaste skript
- * kan hinna före. Diagnostikrutan visar hur tidigt injektionen kom, och vid en
- * sen injektion laddas sidan om en gång (då ligger modulen i TizenBrews cache
- * och hinner oftast före sidans skript).
+ * TizenBrew kör den här filen med CDP Runtime.evaluate när varje nytt dokument
+ * skapar sin JS-kontext. Det sker asynkront, så GFN:s egna skript hinner ofta
+ * före. GFN avgör plattform EN gång vid start (Ragnarok-biblioteket), så en sen
+ * spoof hjälper inte.
  * (evaluateScriptOnDocumentStart används inte: i TizenBrew 2.0.5 öppnas sidan
  * aldrig när man klickar på en sådan modul.)
  *
+ * Därför startar modulen på play.geforcenow.com/robots.txt, en liten textfil
+ * utan GFN-skript. Där sätts spoofen först, och sedan hämtar och skriver modulen
+ * själv in GFN:s index.html i samma fönster (document.write). GFN:s skript körs
+ * alltså alltid efter spoofen. Laddas GFN-sidan ändå direkt (omladdning, retur
+ * från inloggningen) och skriptet kom för sent, startas den om via robots.txt.
+ *
  * Vad den gör:
- *   1. Får GFN:s webbklient att se Chrome på Windows i stället för en Tizen-TV
- *      (navigator.userAgent, userAgentData, platform, vendor).
+ *   1. Får GFN:s webbklient att se Chrome på Windows i stället för en Tizen-TV:
+ *      navigator (userAgent, userAgentData, platform, vendor, plugins), samma
+ *      värden i GFN:s workers, och döljer Samsungs globala objekt.
  *   2. Visar en diagnostikruta på TV:n (blå knapp på fjärrkontrollen), eftersom
  *      det inte går att ansluta DevTools medan TizenBrew använder debug-porten.
- *   3. Ritar en egen muspekare, eftersom TV:n inte visar någon inne i TizenBrew.
- *      Den göms när musen är stilla och när spelet låser musen (pointer lock).
+ *      Rutan visar även GFN:s eget plattformsbeslut.
  *
  * Vad den INTE gör: ändrar inget i spelet, automatiserar ingenting, rör inga
- * HTTP-headers (JS kan inte det; se CLAUDE.md, experiment E4).
+ * HTTP-headers (JS kan inte det).
  */
 (function () {
   'use strict';
@@ -33,27 +38,29 @@
   };
   var lateInjection = injectedAt.readyState !== 'loading';
 
-  var VERSION = '0.1.3';
+  var VERSION = '0.2.0';
+  var GFN_HOST = 'play.geforcenow.com';
+  var BOOT_PATH = '/robots.txt';    // liten textfil på GFN:s domän, utan GFN-skript
+  var BOOT_KEY = 'gfn-tizen-boot';  // #gfn-tizen-boot=<sökväg att visa>
 
   var CONFIG = {
     spoof: true,                    // utge sig för att vara Chrome på Windows
-    hideTizenGlobals: false,        // dölj window.tizen/webapis för sidan (prova om GFN hamnar i TV-läge)
-    trySetHttpUserAgent: false,     // experiment E4: byt även HTTP-headerns UA via tizen.websetting (laddar om en gång)
+    hideTizenGlobals: true,         // dölj Samsungs globala objekt (GFN letar efter dem)
+    spoofWorkers: true,             // samma identitet i GFN:s workers (där läses plattformen)
+    bootViaRobots: true,            // ladda GFN själv efter spoofen (se ovan)
+    gfnHtmlPath: '/mall/',          // där GFN:s index.html serveras
     windowsPlatformVersion: '15.0.0', // motsvarar Windows 11 i client hints
     keepScreenOn: true,             // försök stänga av TV:ns skärmsläckare
-    reloadOnceIfLate: true,         // ladda om sidan en gång om injektionen kom efter att sidan tolkats
-    reloadHosts: ['play.geforcenow.com'], // bara här; aldrig på inloggningssidor (OAuth-koder gäller en gång)
-    cursor: {
-      enabled: true,                // rita en egen muspekare (TizenBrew visar ingen)
-      hideAfterMs: 5000             // göm den när musen varit stilla så här länge (0 = aldrig)
-    },
     overlay: {
       autoShowMs: 20000,            // visa rutan automatiskt så länge efter sidladdning (0 = av)
       toggleKeyCode: 406,           // blå knapp (ColorF3Blue)
       maxLogLines: 40,
-      shownLogLines: 12
+      shownLogLines: 10
     }
   };
+
+  // Globala objekt som avslöjar Tizen (samma lista som GFN:s detektor använder).
+  var TIZEN_GLOBALS = ['tizen', 'webapis', 'b2bapis', 'TizenTVApiInfo', 'addEdgeEffectONSCROLLTizenUIF', 'tizentvwasm'];
 
   var isTop = (function () { try { return window.top === window; } catch (e) { return false; } })();
   var nav = window.navigator;
@@ -65,12 +72,17 @@
   var spoofUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
     '(KHTML, like Gecko) Chrome/' + major + '.0.0.0 Safari/537.36';
 
-  var hidden = {};           // undangömda Tizen-globaler (om hideTizenGlobals)
+  var real = readRealIdentity();
+  var hidden = {};           // undangömda Tizen-globaler
+  var hiddenNames = [];
+  var pluginNote = '';
+  var workerCount = { Worker: 0, SharedWorker: 0 };
+  var startNote = '';
+  var verdict = null;        // GFN:s eget plattformsbeslut
   var logLines = [];
   var overlay = { el: null, visible: false, hideTimer: null, pollTimer: null };
   var unsupportedSeen = false;
   var input = { moves: 0, lastMouse: null, lastClick: null, lastKey: null };
-  var cursor = { el: null, hideTimer: null };
 
   window.__gfnTizenDesktop = {
     version: VERSION,
@@ -95,6 +107,26 @@
     if (overlay.visible) { renderOverlay(); }
   }
 
+  function trunc(s, n) { s = String(s); return s.length > n ? s.substr(0, n - 1) + '…' : s; }
+
+  /* ------------------------------------------------------------ riktig identitet */
+
+  function readRealIdentity() {
+    var r = { platform: '', uaData: '', globals: [], plugins: [] };
+    try { r.platform = String(nav.platform || ''); } catch (e) { /* ignorera */ }
+    try {
+      var d = nav.userAgentData;
+      r.uaData = d ? (d.platform || '""') + ' / ' + (d.brands || []).map(function (b) { return b.brand + ' ' + b.version; }).join(', ') : 'saknas';
+    } catch (e) { r.uaData = 'fel'; }
+    TIZEN_GLOBALS.forEach(function (n) {
+      try { if (window[n]) { r.globals.push(n); } } catch (e) { /* ignorera */ }
+    });
+    try {
+      r.plugins = Array.prototype.map.call(nav.plugins || [], function (p) { return p.name; });
+    } catch (e) { /* ignorera */ }
+    return r;
+  }
+
   /* ------------------------------------------------------------ spoof */
 
   function defineGetter(target, prop, getter) {
@@ -107,55 +139,75 @@
     }
   }
 
-  function buildUAData() {
+  // Värdena för client hints, delas mellan sidan och dess workers.
+  function uaDataValues() {
     var brands = [
       { brand: 'Not_A Brand', version: '8' },
       { brand: 'Chromium', version: major },
       { brand: 'Google Chrome', version: major }
     ];
-    var fullVersionList = [
-      { brand: 'Not_A Brand', version: '8.0.0.0' },
-      { brand: 'Chromium', version: fullVersion },
-      { brand: 'Google Chrome', version: fullVersion }
-    ];
-    var high = {
-      architecture: 'x86',
-      bitness: '64',
+    return {
       brands: brands,
-      fullVersionList: fullVersionList,
-      mobile: false,
-      model: '',
-      platform: 'Windows',
-      platformVersion: CONFIG.windowsPlatformVersion,
-      uaFullVersion: fullVersion,
-      wow64: false,
-      formFactors: ['Desktop']
+      high: {
+        architecture: 'x86',
+        bitness: '64',
+        brands: brands,
+        fullVersionList: [
+          { brand: 'Not_A Brand', version: '8.0.0.0' },
+          { brand: 'Chromium', version: fullVersion },
+          { brand: 'Google Chrome', version: fullVersion }
+        ],
+        mobile: false,
+        model: '',
+        platform: 'Windows',
+        platformVersion: CONFIG.windowsPlatformVersion,
+        uaFullVersion: fullVersion,
+        wow64: false,
+        formFactors: ['Desktop']
+      }
     };
+  }
+
+  function buildUAData(v, UADataCtor) {
     var data = {
-      brands: brands,
+      brands: v.brands,
       mobile: false,
       platform: 'Windows',
       getHighEntropyValues: function (hints) {
-        var out = { brands: brands, mobile: false, platform: 'Windows' };
+        var out = { brands: v.brands, mobile: false, platform: 'Windows' };
         (Array.isArray(hints) ? hints : []).forEach(function (h) {
-          if (Object.prototype.hasOwnProperty.call(high, h)) { out[h] = high[h]; }
+          if (Object.prototype.hasOwnProperty.call(v.high, h)) { out[h] = v.high[h]; }
         });
         return Promise.resolve(out);
       },
-      toJSON: function () { return { brands: brands, mobile: false, platform: 'Windows' }; }
+      toJSON: function () { return { brands: v.brands, mobile: false, platform: 'Windows' }; }
     };
     // Låt instanceof-kontroller lyckas; egna egenskaper skuggar de inbyggda getters.
-    try {
-      if (window.NavigatorUAData && window.NavigatorUAData.prototype) {
-        Object.setPrototypeOf(data, window.NavigatorUAData.prototype);
-      }
-    } catch (e) { /* ignorera */ }
+    try { if (UADataCtor && UADataCtor.prototype) { Object.setPrototypeOf(data, UADataCtor.prototype); } } catch (e) { /* ignorera */ }
     return data;
+  }
+
+  // Samsung-pluginet "PPAPI SAMSUNGHEALTH" räcker för att GFN ska se Tizen.
+  function filteredPlugins() {
+    var all = Array.prototype.slice.call(nav.plugins || []);
+    var kept = all.filter(function (p) { return !/^PPAPI SAMSUNG/i.test(p.name); });
+    if (kept.length === all.length) { return null; }
+    var list = {};
+    kept.forEach(function (p, i) { list[i] = p; });
+    list.length = kept.length;
+    list.item = function (i) { return kept[i] || null; };
+    list.namedItem = function (n) { return kept.filter(function (p) { return p.name === n; })[0] || null; };
+    list.refresh = function () {};
+    list[Symbol.iterator] = function () { return kept[Symbol.iterator](); };
+    try { if (window.PluginArray) { Object.setPrototypeOf(list, window.PluginArray.prototype); } } catch (e) { /* ignorera */ }
+    pluginNote = (all.length - kept.length) + ' Samsung-plugin dolt';
+    return list;
   }
 
   function applySpoof() {
     var proto = Object.getPrototypeOf(nav);
-    var uaData = buildUAData();
+    var uaData = buildUAData(uaDataValues(), window.NavigatorUAData);
+    var plugins = filteredPlugins();
     var props = {
       userAgent: function () { return spoofUA; },
       appVersion: function () { return spoofUA.replace(/^Mozilla\//, ''); },
@@ -164,6 +216,7 @@
       maxTouchPoints: function () { return 0; },
       userAgentData: function () { return uaData; }
     };
+    if (plugins) { props.plugins = function () { return plugins; }; }
     Object.keys(props).forEach(function (p) {
       defineGetter(proto, p, props[p]);
       // Om egenskapen ligger på själva instansen i den här motorn:
@@ -173,42 +226,103 @@
   }
 
   function hideGlobals() {
-    ['tizen', 'webapis', 'b2bapis'].forEach(function (name) {
-      try {
-        hidden[name] = window[name];
-        Object.defineProperty(window, name, {
-          configurable: true,
-          get: function () { return undefined; },
-          set: function (v) { hidden[name] = v; }
-        });
-      } catch (e) {
-        log('kunde inte dölja ' + name + ': ' + e.message);
+    TIZEN_GLOBALS.forEach(function (name) {
+      var had;
+      try { had = name in window; } catch (e) { had = false; }
+      if (!had) { return; }
+      try { hidden[name] = window[name]; } catch (e) { /* ignorera */ }
+      // Helst helt borta (GFN kontrollerar även med "in"), annars en getter som ger undefined.
+      try { delete window[name]; } catch (e) { /* ignorera */ }
+      var still;
+      try { still = name in window; } catch (e) { still = true; }
+      if (still) {
+        try {
+          Object.defineProperty(window, name, {
+            configurable: true,
+            get: function () { return undefined; },
+            set: function (v) { hidden[name] = v; }
+          });
+        } catch (e) {
+          log('kunde inte dölja ' + name + ': ' + e.message);
+          return;
+        }
       }
+      hiddenNames.push(name);
     });
-    log('Tizen-globaler dolda för sidan');
+    if (hiddenNames.length) { log('dolda Tizen-globaler: ' + hiddenNames.join(', ')); }
   }
 
   function tizenApi() { return hidden.tizen || window.tizen; }
   function webApis() { return hidden.webapis || window.webapis; }
 
-  function trySetHttpUserAgent() {
-    var t = tizenApi();
+  // Körs i varje worker som GFN skapar, före GFN:s egen kod.
+  function workerPrelude(c) {
     try {
-      if (!t || !t.websetting || !t.websetting.setUserAgentString) {
-        log('E4: tizen.websetting saknas på sidan');
-        return;
+      var P = self.WorkerNavigator && self.WorkerNavigator.prototype;
+      if (!P) { return; }
+      var def = function (p, v) {
+        try { Object.defineProperty(P, p, { get: function () { return v; }, configurable: true, enumerable: true }); } catch (e) { /* ignorera */ }
+      };
+      def('userAgent', c.ua);
+      def('appVersion', c.ua.replace(/^Mozilla\//, ''));
+      def('platform', 'Win32');
+      var data = {
+        brands: c.v.brands,
+        mobile: false,
+        platform: 'Windows',
+        getHighEntropyValues: function (hints) {
+          var out = { brands: c.v.brands, mobile: false, platform: 'Windows' };
+          (Array.isArray(hints) ? hints : []).forEach(function (h) {
+            if (Object.prototype.hasOwnProperty.call(c.v.high, h)) { out[h] = c.v.high[h]; }
+          });
+          return Promise.resolve(out);
+        },
+        toJSON: function () { return { brands: c.v.brands, mobile: false, platform: 'Windows' }; }
+      };
+      try { if (self.NavigatorUAData) { Object.setPrototypeOf(data, self.NavigatorUAData.prototype); } } catch (e) { /* ignorera */ }
+      def('userAgentData', data);
+    } catch (e) { /* ignorera */ }
+  }
+
+  // GFN:s detektor läser navigator.platform och userAgentData i workers som
+  // skapas från blob-URL:er. Lägg vår prelude först i varje sådan worker.
+  function patchWorkers() {
+    var prelude = '(' + workerPrelude.toString() + ')(' + JSON.stringify({ ua: spoofUA, v: uaDataValues() }) + ');\n';
+    var keep = {};
+    var realRevoke = URL.revokeObjectURL;
+    // GFN återkallar blob-URL:en direkt efter new Worker(); vår worker läser den asynkront.
+    URL.revokeObjectURL = function (u) {
+      if (keep[u]) { setTimeout(function () { realRevoke.call(URL, u); }, 15000); return; }
+      return realRevoke.apply(URL, arguments);
+    };
+    ['Worker', 'SharedWorker'].forEach(function (kind) {
+      var Orig = window[kind];
+      if (typeof Orig !== 'function') { return; }
+      var Wrapped = function (url, opts) {
+        var target = url;
+        try {
+          var u = String(url);
+          if (/^blob:/.test(u)) {
+            var isModule = !!(opts && typeof opts === 'object' && opts.type === 'module');
+            keep[u] = true;
+            var body = prelude + (isModule ? 'import ' + JSON.stringify(u) + ';\n' : 'importScripts(' + JSON.stringify(u) + ');\n');
+            target = URL.createObjectURL(new Blob([body], { type: 'text/javascript' }));
+            setTimeout(function () { realRevoke.call(URL, target); }, 15000);
+            workerCount[kind] += 1;
+          }
+        } catch (e) {
+          log(kind + '-spoof misslyckades: ' + e.message);
+          target = url;
+        }
+        return arguments.length > 1 ? new Orig(target, opts) : new Orig(target);
+      };
+      Wrapped.prototype = Orig.prototype;
+      try {
+        Object.defineProperty(window, kind, { value: Wrapped, configurable: true, writable: true });
+      } catch (e) {
+        log('kunde inte ersätta ' + kind + ': ' + e.message);
       }
-      if (sessionStorage.getItem('gfnTizenUaSet')) { log('E4: HTTP-UA redan satt i den här sessionen'); return; }
-      sessionStorage.setItem('gfnTizenUaSet', '1');
-      t.websetting.setUserAgentString(spoofUA, function () {
-        log('E4: HTTP-UA satt, laddar om');
-        location.reload();
-      }, function (e) {
-        log('E4: setUserAgentString misslyckades: ' + (e && e.message));
-      });
-    } catch (e) {
-      log('E4: ' + e.message);
-    }
+    });
   }
 
   function keepScreenOn() {
@@ -225,6 +339,125 @@
       }
     } catch (e) {
       log('skärmsläckare: ' + e.message);
+    }
+  }
+
+  /* ------------------------------------------------------------ start via robots.txt */
+
+  function isBootDocument() {
+    return isTop && location.hostname === GFN_HOST && location.pathname === BOOT_PATH;
+  }
+
+  function bootTarget() {
+    var m = new RegExp('[#&]' + BOOT_KEY + '=([^&]*)').exec(location.hash);
+    var t = m ? decodeURIComponent(m[1]) : CONFIG.gfnHtmlPath;
+    return /^\/(?!\/)/.test(t) ? t : CONFIG.gfnHtmlPath;   // bara sökvägar på samma domän
+  }
+
+  function hasAuthParams() {
+    return /[?&#](code|state|token|id_token|access_token)=/.test(location.href);
+  }
+
+  // Högst 3 omstarter per 2 minuter, så att ett fel aldrig blir en loop.
+  function rebootAllowed() {
+    try {
+      var now = Date.now();
+      var list = JSON.parse(sessionStorage.getItem('gfnTizenReboots') || '[]').filter(function (t) { return now - t < 120000; });
+      if (list.length >= 3) { return false; }
+      list.push(now);
+      sessionStorage.setItem('gfnTizenReboots', JSON.stringify(list));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function rebootViaRobots(reason) {
+    if (!rebootAllowed()) {
+      log('för många omstarter – fortsätter utan (' + reason + ')');
+      return false;
+    }
+    var path = location.pathname + location.search + location.hash;
+    try { console.log('[gfn-tizen] omstart via ' + BOOT_PATH + ': ' + reason); } catch (e) { /* ignorera */ }
+    location.replace(BOOT_PATH + '#' + BOOT_KEY + '=' + encodeURIComponent(path));
+    return true;
+  }
+
+  // Efter inloggningen: låt GFN byta in koden först, starta sedan om via robots.txt.
+  function rebootAfterAuth() {
+    var waited = 0;
+    log('inloggningsretur – väntar tills GFN tagit emot koden');
+    var timer = setInterval(function () {
+      waited += 1;
+      if (!hasAuthParams() || waited >= 180) {
+        clearInterval(timer);
+        setTimeout(function () { rebootViaRobots('efter inloggning'); }, 5000);
+      }
+    }, 1000);
+  }
+
+  function boot() {
+    var target = bootTarget();
+    startNote = 'via ' + BOOT_PATH + ' – spoof före GFN';
+    log('startar GFN via ' + BOOT_PATH + ' → ' + target);
+    fetch(CONFIG.gfnHtmlPath, { credentials: 'include', cache: 'no-cache' })
+      .then(function (r) {
+        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+        return r.text();
+      })
+      .then(function (html) {
+        history.replaceState(null, '', target);
+        document.open();
+        document.write(html);
+        document.close();
+        // document.open() tar bort elementen och alla lyssnare på window.
+        overlay.el = null;
+        installListeners();
+        onReady();
+      })
+      .catch(function (e) {
+        log('kunde inte starta via ' + BOOT_PATH + ': ' + e.message + ' – laddar GFN direkt');
+        location.replace(target);
+      });
+  }
+
+  /* ------------------------------------------------------------ GFN:s eget beslut */
+
+  // Fråga GFN:s detektor (Ragnarok, webpack-modul) vad den kom fram till.
+  // Bara läsning: getPlatformDetails() är cachad och redan beräknad av GFN.
+  function probeGfnVerdict() {
+    var q = window.webpackChunkgfn_mall;
+    if (!q || typeof q.push !== 'function') { verdict = 'GFN:s webpack saknas'; return; }
+    try {
+      q.push([['gfnTizenProbe' + Date.now()], {}, function (req) {
+        var R = null;
+        try { R = req(56123); } catch (e) { /* modul-id byts vid nya GFN-versioner */ }
+        if (!R || typeof R.getPlatformDetails !== 'function') {
+          var m = req.m || {};
+          Object.keys(m).some(function (id) {
+            try {
+              if (String(m[id]).indexOf('getPlatformDetails=') !== -1) { R = req(id); return true; }
+            } catch (e) { /* ignorera */ }
+            return false;
+          });
+        }
+        if (!R || typeof R.getPlatformDetails !== 'function') { verdict = 'detektorn hittades inte'; return; }
+        R.getPlatformDetails().then(function (d) {
+          var ok;
+          try { ok = R.IsFeatureSupported(R.BrowserFeature.Streaming, d); } catch (e) { ok = '?'; }
+          verdict = [
+            d.os + ' / ' + d.browser + ' ' + (d.browserVer || ''),
+            d.platformType || d.deviceType,
+            'säkerhet ' + d.confidence,
+            d.spoofing ? 'SPOOF UPPTÄCKT' : '',
+            d.forging ? 'forging' : '',
+            'strömning ' + (ok === true ? 'ja' : ok === false ? 'NEJ' : ok)
+          ].filter(Boolean).join(', ');
+          log('GFN-beslut: ' + verdict);
+        }, function (e) { verdict = 'fel: ' + e; });
+      }]);
+    } catch (e) {
+      verdict = 'fel: ' + e.message;
     }
   }
 
@@ -278,30 +511,24 @@
     }
   }
 
-  function trunc(s, n) { s = String(s); return s.length > n ? s.substr(0, n - 1) + '…' : s; }
-
   function diagText() {
     var lines = [
       'GFN Desktop för Tizen v' + VERSION + '      [blå knapp: visa/dölj]',
       'Sida:           ' + location.host + trunc(location.pathname, 60),
-      'Chromium:       ' + major + ' (' + fullVersion + ')',
+      'Start:          ' + (startNote || ('direkt, injicerad ' + injectedAt.ms + ' ms, ' + injectedAt.readyState +
+        ', ' + injectedAt.scripts + ' skript före' + (lateInjection ? ' – SEN' : ' – tidig'))),
+      'GFN-beslut:     ' + (verdict || 'väntar…'),
       'Riktig UA:      ' + trunc(realUA, 120),
-      'Injektion:      ' + injectedAt.ms + ' ms efter sidstart, ' + injectedAt.readyState + ', ' +
-        injectedAt.scripts + ' skript före' + (lateInjection ? ' – SEN' : ' – tidig') +
-        (reloadedForLateness() ? ' (efter 1 omladdning)' : ''),
-      'Spoof:          ' + (nav.userAgent === spoofUA ? 'aktiv – Windows/Chrome ' + major : 'INTE aktiv'),
-      'UA-data:        ' + uaDataText(),
-      'WebRTC:         ' + (window.RTCPeerConnection ? 'finns' : 'SAKNAS'),
-      'Videocodecs:    ' + getVideoCodecs(),
+      'Riktig plattf.: ' + real.platform + ', UA-data ' + trunc(real.uaData, 70),
+      'Spoof:          ' + (nav.userAgent === spoofUA ? 'aktiv – Windows/Chrome ' + major + ' (' + fullVersion + ')' : 'INTE aktiv') +
+        ', UA-data ' + uaDataText(),
+      'Tizen-spår:     ' + (real.globals.length ? real.globals.join(', ') : 'inga globaler') +
+        (hiddenNames.length ? ' (dolda)' : '') + (pluginNote ? ', ' + pluginNote : '') +
+        ', workers ' + workerCount.Worker + '+' + workerCount.SharedWorker + ' spoofade',
+      'WebRTC:         ' + (window.RTCPeerConnection ? 'finns' : 'SAKNAS') + ', codecs ' + getVideoCodecs(),
       'Handkontroller: ' + gamepadText(),
-      'Mus:            ' + (input.moves
-        ? input.moves + ' rörelser, senast ' + input.lastMouse.x + ',' + input.lastMouse.y +
-          (document.pointerLockElement ? ' (låst av spelet)' : '')
-        : 'inga mushändelser än') +
-        (input.lastClick ? ', klick: ' + input.lastClick : ''),
-      'Tangent:        ' + (input.lastKey || '–'),
-      'Tizen-API:      tizen ' + (tizenApi() ? 'ja' : 'nej') + ', webapis ' + (webApis() ? 'ja' : 'nej') +
-        (CONFIG.hideTizenGlobals ? ' (dolda för sidan)' : ''),
+      'Mus/tangent:    ' + (input.moves ? input.moves + ' musrörelser' : 'inga mushändelser') +
+        (input.lastClick ? ', klick: ' + input.lastClick : '') + ', tangent ' + (input.lastKey || '–'),
       'Fönster:        ' + window.innerWidth + '×' + window.innerHeight + ' @' + (window.devicePixelRatio || 1) +
         ', skärm ' + screen.width + '×' + screen.height,
       '──── logg ────'
@@ -310,12 +537,12 @@
   }
 
   function ensureOverlay() {
-    if (overlay.el) { return overlay.el; }
+    if (overlay.el && overlay.el.isConnected) { return overlay.el; }
     if (!document.body) { return null; }
     var el = document.createElement('div');
     el.id = 'gfn-tizen-overlay';
     el.style.cssText = [
-      'position:fixed', 'top:24px', 'left:24px', 'max-width:1240px', 'z-index:2147483647',
+      'position:fixed', 'top:24px', 'left:24px', 'max-width:1300px', 'z-index:2147483647',
       'background:rgba(0,0,0,0.85)', 'color:#d9ffd9', 'font:17px/1.35 monospace',
       'padding:14px 18px', 'border-radius:10px', 'white-space:pre-wrap',
       'pointer-events:none', 'display:none'
@@ -366,59 +593,13 @@
     }, 5000);
   }
 
-  /* ------------------------------------------------------------ muspekare */
-
-  function ensureCursor() {
-    if (cursor.el) { return cursor.el; }
-    if (!document.body) { return null; }
-    // Byggs med DOM-anrop (inte innerHTML) så att det fungerar även med Trusted Types.
-    var ns = 'http://www.w3.org/2000/svg';
-    var el = document.createElement('div');
-    el.id = 'gfn-tizen-cursor';
-    el.style.cssText = [
-      'position:fixed', 'left:0', 'top:0', 'width:28px', 'height:28px', 'z-index:2147483647',
-      'pointer-events:none', 'display:none', 'will-change:transform'
-    ].join(';');
-    var svg = document.createElementNS(ns, 'svg');
-    svg.setAttribute('width', '28');
-    svg.setAttribute('height', '28');
-    svg.setAttribute('viewBox', '0 0 28 28');
-    var path = document.createElementNS(ns, 'path');
-    path.setAttribute('d', 'M2 2 L2 22 L7.5 16.8 L11.5 25.5 L15.3 23.8 L11.4 15.3 L19 15.3 Z');
-    path.setAttribute('fill', '#fff');
-    path.setAttribute('stroke', '#000');
-    path.setAttribute('stroke-width', '1.6');
-    path.setAttribute('stroke-linejoin', 'round');
-    svg.appendChild(path);
-    el.appendChild(svg);
-    document.body.appendChild(el);
-    cursor.el = el;
-    return el;
-  }
-
-  function hideCursor() {
-    clearTimeout(cursor.hideTimer);
-    if (cursor.el) { cursor.el.style.display = 'none'; }
-  }
-
-  function showCursorAt(x, y) {
-    if (!CONFIG.cursor.enabled) { return; }
-    if (document.pointerLockElement) { hideCursor(); return; }
-    var el = ensureCursor();
-    if (!el) { return; }
-    el.style.transform = 'translate(' + (x - 2) + 'px,' + (y - 2) + 'px)';
-    el.style.display = 'block';
-    clearTimeout(cursor.hideTimer);
-    if (CONFIG.cursor.hideAfterMs) { cursor.hideTimer = setTimeout(hideCursor, CONFIG.cursor.hideAfterMs); }
-  }
-
   // Kort beskrivning av ett klickat element, utan värden från formulärfält.
   function describe(t) {
     if (!t || !t.tagName) { return '?'; }
-    var s = t.tagName.toLowerCase();
-    if (t.id) { s += '#' + trunc(t.id, 24); }
-    if (t.type && /^(input|button)$/.test(s.split('#')[0])) { s += '[' + t.type + ']'; }
-    if (!/^(input|textarea|select)/.test(s)) {
+    var tag = t.tagName.toLowerCase();
+    var s = tag + (t.id ? '#' + trunc(t.id, 24) : '');
+    if (t.type && /^(input|button)$/.test(tag)) { s += '[' + t.type + ']'; }
+    if (!/^(input|textarea|select)$/.test(tag)) {
       var txt = String(t.innerText || t.textContent || '').replace(/\s+/g, ' ').trim();
       if (txt) { s += ' "' + trunc(txt, 24) + '"'; }
     }
@@ -460,26 +641,12 @@
       if (!input.moves) { log('första mushändelse (' + e.clientX + ',' + e.clientY + ')'); }
       input.moves += 1;
       input.lastMouse = { x: e.clientX, y: e.clientY };
-      showCursorAt(e.clientX, e.clientY);
     }, true);
 
     window.addEventListener('mousedown', function (e) {
       input.lastClick = describe(e.target) + ' @' + e.clientX + ',' + e.clientY;
-      if (!input.moves) { input.lastMouse = { x: e.clientX, y: e.clientY }; }
       log('klick: ' + input.lastClick);
-      showCursorAt(e.clientX, e.clientY);
     }, true);
-
-    // Pekaren lämnar dokumentet (eller går in i en iframe som ritar sin egen).
-    document.addEventListener('mouseout', function (e) {
-      if (!e.relatedTarget) { hideCursor(); }
-    }, true);
-
-    document.addEventListener('pointerlockchange', function () {
-      var locked = !!document.pointerLockElement;
-      if (locked) { hideCursor(); }
-      log('pointer lock ' + (locked ? 'på' : 'av'));
-    });
 
     window.addEventListener('keydown', function (e) {
       input.lastKey = keyName(e);
@@ -499,36 +666,35 @@
   function onReady() {
     if (!isTop) { return; }
     log('sida laddad: ' + location.host + location.pathname);
-    log('injicerad efter ' + injectedAt.ms + ' ms (' + injectedAt.readyState + ', ' + injectedAt.scripts + ' skript)');
+    if (!startNote) {
+      log('injicerad efter ' + injectedAt.ms + ' ms (' + injectedAt.readyState + ', ' + injectedAt.scripts + ' skript)');
+    }
     if (CONFIG.keepScreenOn) { keepScreenOn(); }
     if (CONFIG.overlay.autoShowMs) { showOverlay(CONFIG.overlay.autoShowMs); }
     watchForUnsupportedText();
+    if (location.hostname === GFN_HOST) { setTimeout(probeGfnVerdict, 8000); }
   }
 
   /* ------------------------------------------------------------ start */
 
-  function reloadedForLateness() {
-    try { return sessionStorage.getItem('gfnTizenLateReload') === '1'; } catch (e) { return false; }
-  }
-
-  // Sen injektion: sidans skript kan redan ha läst av webbläsaren. Ladda om en
-  // gång per flik och origin; nästa gång ligger modulen i TizenBrews cache.
-  // Bara på GFN-sidan och aldrig med inloggningsparametrar i adressen: en
-  // omladdning av NVIDIA:s callback återanvänder en engångskod och ger svart sida.
-  var reloadAllowed = CONFIG.reloadHosts.indexOf(location.hostname) !== -1 &&
-    !/[?&#](code|state|token|id_token|access_token)=/.test(location.href);
-  if (CONFIG.reloadOnceIfLate && isTop && lateInjection && reloadAllowed && !reloadedForLateness()) {
-    try {
-      sessionStorage.setItem('gfnTizenLateReload', '1');
-      try { console.log('[gfn-tizen] sen injektion (' + injectedAt.readyState + '), laddar om en gång'); } catch (e) { /* ignorera */ }
-      location.reload();
-      return;
-    } catch (e) { /* sessionStorage saknas: fortsätt utan omladdning */ }
-  }
-
   if (CONFIG.hideTizenGlobals) { hideGlobals(); }
   if (CONFIG.spoof) { applySpoof(); }
-  if (CONFIG.spoof && CONFIG.trySetHttpUserAgent && isTop) { trySetHttpUserAgent(); }
+  if (CONFIG.spoof && CONFIG.spoofWorkers) { patchWorkers(); }
+
+  if (CONFIG.bootViaRobots && isBootDocument()) {
+    boot();
+    return;
+  }
+
+  // GFN-sidan laddad direkt och vi kom för sent: GFN har redan avgjort plattformen.
+  if (CONFIG.bootViaRobots && isTop && location.hostname === GFN_HOST && lateInjection) {
+    if (hasAuthParams()) {
+      rebootAfterAuth();
+    } else if (rebootViaRobots('sen injektion (' + injectedAt.readyState + ')')) {
+      return;
+    }
+  }
+
   installListeners();
 
   if (document.readyState === 'loading') {

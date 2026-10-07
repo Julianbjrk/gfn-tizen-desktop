@@ -6,10 +6,10 @@ Unofficial and for personal use. Not affiliated with NVIDIA or Samsung. Changing
 
 ## What it does
 
-- Overrides `navigator.userAgent`, `navigator.userAgentData` (including `getHighEntropyValues`), `platform` and `vendor` as soon as TizenBrew injects the script into a new page. The real Chromium major version is kept.
-- If the injection arrives after the GFN page has been parsed, reloads it once (per tab) so the cached script can run before the page's own scripts. Never reloads login pages or URLs carrying OAuth parameters.
-- Shows a diagnostics panel on the TV (**blue** remote button). The panel lists the spoof status, WebRTC availability, video codecs, connected gamepads, mouse/key activity (typed characters are never shown) and recent errors.
-- Draws its own mouse pointer, because the TV shows none inside TizenBrew. It hides after a few idle seconds and while the game has pointer lock.
+- Starts at `play.geforcenow.com/robots.txt` (a small text file on the GFN origin, no GFN scripts), applies the identity there, then loads the GFN web client itself into the same window. GFN detects the platform once at start-up, and TizenBrew injects scripts asynchronously, so this is the only reliable way to be first.
+- Overrides `navigator.userAgent`, `userAgentData` (including `getHighEntropyValues`), `platform`, `vendor` and `plugins`, applies the same values inside GFN's blob workers, and hides Samsung's global objects (`tizen`, `webapis`, `TizenTVApiInfo`, …). The real Chromium version is kept.
+- If a GFN page is loaded directly and the script arrives too late, restarts it via `robots.txt` (at most three times in two minutes). After a login redirect it first waits until GFN has consumed the OAuth code.
+- Shows a diagnostics panel on the TV (**blue** remote button): start mode, GFN's own platform verdict, real and spoofed identity, hidden Tizen traces, WebRTC codecs, gamepads, mouse/key activity (typed characters are never shown) and recent errors.
 - Tries to keep the TV screensaver off while the page is open.
 
 It does not modify games, automate input or touch HTTP headers.
@@ -17,7 +17,7 @@ It does not modify games, automate input or touch HTTP headers.
 ## Install
 
 1. Install TizenBrew on the TV.
-2. In TizenBrew, open **Module Manager**, choose **Add Module**, select the GitHub type and enter `Julianbjrk/gfn-tizen-desktop@v0.1.3` (latest release tag). Prefer a tag over `@main`, which jsDelivr may serve from cache.
+2. In TizenBrew, open **Module Manager**, choose **Add Module**, select the GitHub type and enter `Julianbjrk/gfn-tizen-desktop@v0.2.0` (latest release tag). Prefer a tag over `@main`, which jsDelivr may serve from cache.
 3. Launch **GFN Desktop** from the TizenBrew dashboard.
 
 ## Configuration
@@ -27,13 +27,11 @@ Edit the `CONFIG` object at the top of `inject.js`:
 | Key | Default | Purpose |
 |---|---|---|
 | `spoof` | `true` | Present as Chrome on Windows |
-| `hideTizenGlobals` | `false` | Hide `window.tizen`/`webapis` from the page |
-| `trySetHttpUserAgent` | `false` | Also change the HTTP User-Agent via `tizen.websetting` (reloads once) |
+| `hideTizenGlobals` | `true` | Hide `tizen`, `webapis`, `TizenTVApiInfo` and similar globals from the page |
+| `spoofWorkers` | `true` | Apply the same identity inside blob workers |
+| `bootViaRobots` | `true` | Load GFN from `robots.txt` after the identity is in place |
+| `gfnHtmlPath` | `'/mall/'` | Where GFN's `index.html` is served |
 | `keepScreenOn` | `true` | Try to disable the TV screensaver |
-| `reloadOnceIfLate` | `true` | Reload once if the script was injected after the page was parsed |
-| `reloadHosts` | `['play.geforcenow.com']` | Hosts where that reload may happen |
-| `cursor.enabled` | `true` | Draw a mouse pointer |
-| `cursor.hideAfterMs` | `5000` | Hide the pointer after this long without movement (`0` = never) |
 | `overlay.autoShowMs` | `20000` | Show diagnostics this long after page load (`0` = off) |
 
 ## License
